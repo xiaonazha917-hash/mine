@@ -805,6 +805,258 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
 
     # return loss, variables, weighted_losses
 
+# def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss, sil_thres,
+#              use_l1, ignore_outlier_depth_loss, tracking=False, mapping=False, do_ba=False, device="cuda",
+#              plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, load_semantics=False):
+#     # Initialize Loss Dictionary
+#     losses = {}
+
+#     if tracking:
+#         # Get current frame Gaussians, where only the camera pose gets gradient
+#         transformed_pts = transform_to_frame(params, iter_time_idx, gaussians_grad=False,
+#                                              camera_grad=True, device=device)
+#     elif mapping:
+#         if do_ba:
+#             # Get current frame Gaussians, where both camera pose and Gaussians get gradient
+#             transformed_pts = transform_to_frame(params, iter_time_idx, gaussians_grad=True,
+#                                                  camera_grad=True, device=device)
+#         else:
+#             # Get current frame Gaussians, where only the Gaussians get gradient
+#             transformed_pts = transform_to_frame(params, iter_time_idx, gaussians_grad=True,
+#                                                  camera_grad=False, device=device)
+#     else:
+#         # Get current frame Gaussians, where only the Gaussians get gradient
+#         transformed_pts = transform_to_frame(params, iter_time_idx, gaussians_grad=True,
+#                                              camera_grad=False, device=device)
+
+#     # Initialize Render Variables
+#     rendervar = transformed_params2rendervar(params, transformed_pts, device=device)
+#     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
+#                                                                  transformed_pts, device=device)
+#     # RGB Rendering
+#     rendervar['means2D'].retain_grad()
+#     im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+#     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+
+#     # Depth & Silhouette Rendering
+#     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+#     depth = depth_sil[0, :, :].unsqueeze(0)
+#     silhouette = depth_sil[1, :, :]
+#     presence_sil_mask = (silhouette > sil_thres)
+#     depth_sq = depth_sil[2, :, :].unsqueeze(0)
+#     uncertainty = depth_sq - depth**2
+#     uncertainty = uncertainty.detach()
+
+#     # Semantic colors Rendering
+#     rendered_seg = None
+#     if load_semantics:
+#         semantic_rendervar = transformed_semantics2rendervar(params, transformed_pts, device=device)
+#         rendered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
+
+
+#     # =========================================================================================
+#     # ✅ 核心优化：解耦的双向语义掩码策略 (Decoupled Bi-directional Masking)
+#     # =========================================================================================
+#     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
+    
+#     # 1. 提取【真实观测掩码】(YOLO 提供的视野状态)
+#     obs_mask = curr_data['mask'].reshape(curr_data['depth'].shape) if 'mask' in curr_data else None
+
+#     # 2. 提取【地图渲染掩码】(系统脑海中的记忆状态)
+#     # rendered_mask = None
+#     # # print("==22222=======================rendered_seg=================================",rendered_seg)
+#     # if load_semantics and rendered_seg is not None and 'dynamic_class_ids' in curr_data:
+#     #     dyn_ids = torch.tensor(curr_data['dynamic_class_ids'], dtype=torch.long, device=device)
+#     #     print("==进入第一层=================================")
+#     #     # 防御性形状检查
+       
+#     #     if rendered_seg.shape[0] > 1:
+#     #         rendered_class_id = rendered_seg.argmax(dim=0)
+#     #         print("-22222--------------------------情况A------------------------------------")   
+#     #     else:
+#     #         rendered_class_id = rendered_seg.squeeze(0)
+#     #         print("-22222-------------------情况B--------------------")    
+#     #     print("-进入第二层----------------------------出结果---------------------")    
+#     #     rendered_dynamic = torch.isin(rendered_class_id.long(), dyn_ids)
+#     #     rendered_mask = ~rendered_dynamic.reshape(curr_data['depth'].shape)
+
+    
+
+#     rendered_mask = None
+#     if load_semantics and rendered_seg is not None and 'dynamic_class_ids' in curr_data:
+#         dyn_ids = torch.tensor(curr_data['dynamic_class_ids'], dtype=torch.long, device=device)
+        
+#         if rendered_seg.shape[0] > 1:
+#             # =========================================================================
+#             # 🚀【完美修复：RGB 黑背景拦截机制】
+#             # 因为 rendered_seg 是 3通道的 RGB 图！argmax 只会输出 0(红), 1(绿), 2(蓝)。
+#             # =========================================================================
+#             max_color_value, _ = rendered_seg.max(dim=0)
+            
+#             # 原本的错误逻辑：直接取 argmax
+#             rendered_class_id = rendered_seg.argmax(dim=0)
+            
+#             # 严谨纠偏：如果连 0.3 的亮度都达不到，说明是黑色背景或渲染噪点
+#             is_background = (max_color_value < 0.3)
+            
+#             # 强行改为绝对安全的背景 ID (255)
+#             rendered_class_id[is_background] = 255  
+#             # =========================================================================
+#         else:
+#             rendered_class_id = rendered_seg.squeeze(0)
+            
+#         rendered_dynamic = torch.isin(rendered_class_id.long(), dyn_ids)
+#         rendered_mask = ~rendered_dynamic.reshape(curr_data['depth'].shape)    
+
+#     # 3. 合并掩码：根据 Tracking 还是 Mapping 采取截然不同的哲学！
+#     if tracking:
+#         # 【Tracking 定位阶段】：惹不起躲得起！
+#         # 只要现实或者记忆里有一方判定是动态，就一票否决，坚决不用它算位姿。
+#         if obs_mask is not None and rendered_mask is not None:
+#             semantic_mask = obs_mask & rendered_mask
+#             print("__________这个开始工作___________")
+#         elif obs_mask is not None:
+#             semantic_mask = obs_mask
+#         elif rendered_mask is not None:
+#             semantic_mask = rendered_mask
+#         else:
+#             semantic_mask = None
+#     else:
+#         # 【Mapping 建图阶段】：铁面无私，消灭幽灵！
+#         # 绝不包庇地图里的“渲染幽灵”。只看现实视野 (obs_mask) 是否被挡住。
+#         # 如果现实是干净的墙，强行计算误差，产生巨大梯度去洗刷地图记忆里的幽灵！
+#         semantic_mask = obs_mask
+
+#     # 4. MAD 异常深度过滤 (带语义兜底保障)
+#     if ignore_outlier_depth_loss:
+#         depth_error = torch.abs(curr_data['depth'] - depth) * (curr_data['depth'] > 0)
+        
+#         if semantic_mask is not None:
+#             # 在极其纯净的静态区域计算中位数
+#             static_error_region = depth_error[semantic_mask & (curr_data['depth'] > 0)]
+#             total_valid_depth_pixels = (curr_data['depth'] > 0).sum().item()
+#             min_static_pixels_required = max(2000, int(total_valid_depth_pixels * 0.01))
+#             print("--------min_static_pixels_required----------",min_static_pixels_required)
+#             if static_error_region.numel() > min_static_pixels_required:
+#                 pure_median = static_error_region.median()
+#             else:
+#                 pure_median = depth_error.median() 
+#         else:
+#             pure_median = depth_error.median()
+            
+#         mad_multiplier = 8.0 
+#         mask = (depth_error < mad_multiplier * pure_median)
+#         mask = mask & (curr_data['depth'] > 0)
+#     else:
+#         mask = (curr_data['depth'] > 0)
+        
+#     mask = mask & nan_mask
+
+#     # 5. 加上空洞屏蔽 (仅Tracking阶段)
+#     if tracking and use_sil_for_loss:
+#         mask = mask & presence_sil_mask
+
+#     # 6. 最后一道防线：强行套上我们刚才精心设计的语义掩码
+#     if semantic_mask is not None:
+#         mask = mask & semantic_mask
+#     # =========================================================================================
+
+#     # Depth loss
+#     if use_l1:
+#         mask = mask.detach()
+#         if tracking:
+#             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
+#         else:
+#             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].mean()
+    
+#     # RGB Loss & Semantic Seg Loss
+#     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
+#         color_mask = torch.tile(mask, (3, 1, 1))
+#         color_mask = color_mask.detach()
+#         losses['im'] = torch.abs(curr_data['im'] - im)[color_mask].sum()
+#         if load_semantics and rendered_seg is not None:
+#             losses['seg'] = torch.abs(curr_data['semantic_color'] - rendered_seg)[color_mask].sum()
+#     elif tracking:
+#         losses['im'] = torch.abs(curr_data['im'] - im).sum()
+#         if load_semantics and rendered_seg is not None:
+#             losses['seg'] = torch.abs(curr_data['semantic_color'] - rendered_seg).sum()
+#     # else:
+#     #     losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+#     #     if load_semantics and rendered_seg is not None:
+#     #         losses['seg'] = 0.8 * l1_loss_v1(rendered_seg, curr_data['semantic_color']) \
+#     #             + 0.2 * (1.0 - calc_ssim(rendered_seg, curr_data['semantic_color']))
+
+#     else:     # 这是 Mapping 建图分支
+#            # 1. 把 1 通道的 mask 变成 3 通道的彩色 mask
+#            color_mask = torch.tile(mask, (3, 1, 1)).detach()
+        
+#             # 2. 核心修复：给渲染图和真实图都“戴上面具”
+#             # 动态人物所在的地方，乘以 0 后全部变成纯黑；静态墙壁不受影响
+#            masked_im = im * color_mask
+#            masked_gt_im = curr_data['im'] * color_mask
+        
+#            # 3. 在戴了面具的图片上计算 L1 和 SSIM 误差
+#            losses['im'] = 0.8 * l1_loss_v1(masked_im, masked_gt_im) + 0.2 * (1.0 - calc_ssim(masked_im, masked_gt_im))
+        
+#            # 4. 如果有语义图，也同样戴上面具处理
+#            if load_semantics and rendered_seg is not None:
+#               masked_seg = rendered_seg * color_mask
+#               masked_gt_seg = curr_data['semantic_color'] * color_mask
+#               losses['seg'] = 0.8 * l1_loss_v1(masked_seg, masked_gt_seg) \
+#                   + 0.2 * (1.0 - calc_ssim(masked_seg, masked_gt_seg))       
+
+#     # Visualize the Diff Images 
+#     if tracking and visualize_tracking_loss:
+#         fig, ax = plt.subplots(2, 4, figsize=(12, 6))
+#         weighted_render_im = im * color_mask
+#         weighted_im = curr_data['im'] * color_mask
+#         weighted_render_depth = depth * mask
+#         weighted_depth = curr_data['depth'] * mask
+#         diff_rgb = torch.abs(weighted_render_im - weighted_im).mean(dim=0).detach().cpu()
+#         diff_depth = torch.abs(weighted_render_depth - weighted_depth).mean(dim=0).detach().cpu()
+#         viz_img = torch.clip(weighted_im.permute(1, 2, 0).detach().cpu(), 0, 1)
+#         ax[0, 0].imshow(viz_img)
+#         ax[0, 0].set_title("Weighted GT RGB")
+#         viz_render_img = torch.clip(weighted_render_im.permute(1, 2, 0).detach().cpu(), 0, 1)
+#         ax[1, 0].imshow(viz_render_img)
+#         ax[1, 0].set_title("Weighted Rendered RGB")
+#         ax[0, 1].imshow(weighted_depth[0].detach().cpu(), cmap="jet", vmin=0, vmax=6)
+#         ax[0, 1].set_title("Weighted GT Depth")
+#         ax[1, 1].imshow(weighted_render_depth[0].detach().cpu(), cmap="jet", vmin=0, vmax=6)
+#         ax[1, 1].set_title("Weighted Rendered Depth")
+#         ax[0, 2].imshow(diff_rgb, cmap="jet", vmin=0, vmax=0.8)
+#         ax[0, 2].set_title(f"Diff RGB, Loss: {torch.round(losses['im'])}")
+#         ax[1, 2].imshow(diff_depth, cmap="jet", vmin=0, vmax=0.8)
+#         ax[1, 2].set_title(f"Diff Depth, Loss: {torch.round(losses['depth'])}")
+#         ax[0, 3].imshow(presence_sil_mask.detach().cpu(), cmap="gray")
+#         ax[0, 3].set_title("Silhouette Mask")
+#         ax[1, 3].imshow(mask[0].detach().cpu(), cmap="gray")
+#         ax[1, 3].set_title("Loss Mask")
+#         # Turn off axis
+#         for i in range(2):
+#             for j in range(4):
+#                 ax[i, j].axis('off')
+#         # Set Title
+#         fig.suptitle(f"Tracking Iteration: {tracking_iteration}", fontsize=16)
+#         # Figure Tight Layout
+#         fig.tight_layout()
+#         os.makedirs(plot_dir, exist_ok=True)
+#         plt.savefig(os.path.join(plot_dir, f"tmp.png"), bbox_inches='tight')
+#         plt.close()
+#         plot_img = cv2.imread(os.path.join(plot_dir, f"tmp.png"))
+#         cv2.imshow('Diff Images', plot_img)
+#         cv2.waitKey(1)
+
+#     weighted_losses = {k: v * loss_weights[k] for k, v in losses.items()}
+#     loss = sum(weighted_losses.values())
+
+#     seen = radius > 0
+#     variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
+#     variables['seen'] = seen
+#     weighted_losses['loss'] = loss
+
+#     return loss, variables, weighted_losses
+
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss, sil_thres,
              use_l1, ignore_outlier_depth_loss, tracking=False, mapping=False, do_ba=False, device="cuda",
              plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, load_semantics=False):
@@ -853,7 +1105,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         semantic_rendervar = transformed_semantics2rendervar(params, transformed_pts, device=device)
         rendered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
 
-
     # =========================================================================================
     # ✅ 核心优化：解耦的双向语义掩码策略 (Decoupled Bi-directional Masking)
     # =========================================================================================
@@ -864,29 +1115,136 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
     # 2. 提取【地图渲染掩码】(系统脑海中的记忆状态)
     rendered_mask = None
-    # print("==22222=======================rendered_seg=================================",rendered_seg)
     if load_semantics and rendered_seg is not None and 'dynamic_class_ids' in curr_data:
         dyn_ids = torch.tensor(curr_data['dynamic_class_ids'], dtype=torch.long, device=device)
-        print("==进入第一层=================================")
-        # 防御性形状检查
        
         if rendered_seg.shape[0] > 1:
-            rendered_class_id = rendered_seg.argmax(dim=0)
-            print("-22222--------------------------情况A------------------------------------")   
+            # =========================================================================
+            # 🚀【多类别完美兼容版：欧氏距离色彩匹配法】
+            # =========================================================================
+            # 1. 定义你的全局颜色字典 (请根据你自己的数据集 YOLO 颜色映射进行修改)
+            # 格式：{ 类别ID : [R, G, B] }，注意数值是归一化后的 0.0 ~ 1.0
+            color_dict = {
+               0: [1.0, 0.0, 0.0],    # person: 原BGR[0,0,255] -> RGB[255,0,0] -> [1.0, 0.0, 0.0]
+    1: [0.0, 1.0, 0.0],    # bicycle: 原BGR[0,255,0] -> RGB[0,255,0] -> [0.0, 1.0, 0.0]
+    2: [0.0, 0.0, 1.0],    # car: 原BGR[255,0,0] -> RGB[0,0,255] -> [0.0, 0.0, 1.0]
+    3: [0.0, 1.0, 1.0],    # motorcycle: 原BGR[0,255,255] -> RGB[255,255,0] -> [1.0, 1.0, 0.0]
+    4: [1.0, 0.0, 1.0],    # airplane: 原BGR[255,0,255] -> RGB[255,0,255] -> [1.0, 0.0, 1.0]
+    5: [0.0, 1.0, 1.0],    # bus: 原BGR[255,255,0] -> RGB[0,255,255] -> [0.0, 1.0, 1.0]
+    6: [0.50196, 0.0, 0.50196], # train: 原BGR[128,0,128] -> RGB[128,0,128] -> [0.5, 0.0, 0.5]
+    7: [0.50196, 0.50196, 0.0], # truck: 原BGR[0,128,128] -> RGB[128,128,0] -> [0.5, 0.5, 0.0]
+    8: [0.0, 0.50196, 0.50196], # boat: 原BGR[128,128,0] -> RGB[0,128,128] -> [0.0, 0.5, 0.5]
+    9: [1.0, 0.64706, 0.0],    # traffic light: 原BGR[0,165,255] -> RGB[255,165,0] -> [1.0, 0.65, 0.0]
+    10: [0.50196, 0.0, 0.0],   # fire hydrant: 原BGR[0,0,128] -> RGB[128,0,0] -> [0.5, 0.0, 0.0]
+    11: [0.50196, 0.50196, 0.50196], # stop sign: 原BGR[128,128,128] -> [0.5, 0.5, 0.5]
+    12: [0.75294, 0.75294, 0.75294], # parking meter: 原BGR[192,192,192] -> [0.75, 0.75, 0.75]
+    13: [0.0, 0.50196, 0.0],    # bench: 原BGR[0,128,0] -> [0.0, 0.5, 0.0]
+    14: [0.29412, 0.0, 0.5098], # bird: 原BGR[130,0,75] -> RGB[75,0,130] -> [0.29, 0.0, 0.51]
+    15: [1.0, 0.84314, 0.0],    # cat: 原BGR[0,215,255] -> RGB[255,215,0] -> [1.0, 0.84, 0.0]
+    16: [0.13333, 0.5451, 0.13333], # dog: 原BGR[34,139,34] -> [0.13, 0.55, 0.13]
+    17: [0.35294, 0.35294, 0.80392], # horse: 原BGR[205,90,90] -> RGB[90,90,205] -> [0.35, 0.35, 0.8]
+    18: [0.88235, 0.89412, 1.0],    # sheep: 原BGR[255,228,225] -> RGB[225,228,255] -> [0.88, 0.89, 1.0]
+    19: [0.07451, 0.27059, 0.5451], # cow: 原BGR[139,69,19] -> RGB[19,69,139] -> [0.07, 0.27, 0.55]
+    20: [0.41176, 0.41176, 0.41176], # elephant: 原BGR[105,105,105] -> [0.41, 0.41, 0.41]
+    21: [0.16471, 0.16471, 0.64706], # bear: 原BGR[165,42,42] -> RGB[42,42,165] -> [0.16, 0.16, 0.65]
+    22: [0.0, 0.0, 0.0],           # zebra: [0.0, 0.0, 0.0]
+    23: [0.0, 0.84314, 1.0],       # giraffe: 原BGR[255,215,0] -> RGB[0,215,255] -> [0.0, 0.84, 1.0]
+    24: [0.60392, 0.98039, 0.0],   # backpack: 原BGR[0,250,154] -> RGB[154,250,0] -> [0.6, 0.98, 0.0]
+    25: [0.70588, 0.5098, 0.27451],# umbrella: 原BGR[70,130,180] -> RGB[180,130,70] -> [0.7, 0.5, 0.27]
+    26: [0.83922, 0.43922, 0.8549],# handbag: 原BGR[218,112,214] -> RGB[214,112,218] -> [0.84, 0.44, 0.85]
+    27: [0.54902, 0.90196, 0.94118],# tie: 原BGR[240,230,140] -> RGB[140,230,240] -> [0.55, 0.9, 0.94]
+    28: [0.11765, 0.41176, 0.82353],# suitcase: 原BGR[210,105,30] -> RGB[30,105,210] -> [0.12, 0.41, 0.82]
+    29: [0.70588, 0.41176, 1.0],    # frisbee: 原BGR[255,105,180] -> RGB[180,105,255] -> [0.7, 0.41, 1.0]
+    30: [0.0, 0.54902, 1.0],       # skis: 原BGR[255,140,0] -> RGB[0,140,255] -> [0.0, 0.55, 1.0]
+    31: [0.0, 0.27059, 1.0],       # snowboard: 原BGR[255,69,0] -> RGB[0,69,255] -> [0.0, 0.27, 1.0]
+    32: [0.27843, 0.38824, 1.0],    # sports ball: 原BGR[255,99,71] -> RGB[71,99,255] -> [0.28, 0.39, 1.0]
+    33: [0.44706, 0.50196, 0.98039],# kite: 原BGR[250,128,114] -> RGB[114,128,250] -> [0.45, 0.5, 0.98]
+    34: [0.47843, 0.58824, 0.91373],# baseball bat: 原BGR[233,150,122] -> RGB[122,150,233] -> [0.48, 0.59, 0.91]
+    35: [0.50196, 0.50196, 0.94118],# baseball glove: 原BGR[240,128,128] -> RGB[128,128,240] -> [0.5, 0.5, 0.94]
+    36: [0.36078, 0.36078, 0.80392],# skateboard: 原BGR[205,92,92] -> RGB[92,92,205] -> [0.36, 0.36, 0.8]
+    37: [0.23529, 0.07843, 0.86275],# surfboard: 原BGR[220,20,60] -> RGB[60,20,220] -> [0.24, 0.08, 0.86]
+    38: [0.13333, 0.13333, 0.69804],# tennis racket: 原BGR[178,34,34] -> RGB[34,34,178] -> [0.13, 0.13, 0.7]
+    39: [0.0, 0.0, 0.5451],        # bottle: [0.0, 0.0, 0.55]
+    40: [0.0, 0.0, 0.50196],       # wine glass: [0.0, 0.0, 0.5]
+    41: [0.94118, 1.0, 1.0],       # cup: [0.94, 1.0, 1.0]
+    42: [0.80392, 0.98039, 1.0],    # fork: [0.8, 0.98, 1.0]
+    43: [0.84314, 0.92157, 0.98039],# knife: [0.84, 0.92, 0.98]
+    44: [0.83529, 0.93725, 1.0],    # spoon: [0.84, 0.94, 1.0]
+    45: [0.7098, 0.89412, 1.0],     # bowl: [0.71, 0.89, 1.0]
+    46: [0.72549, 0.8549, 1.0],     # banana: [0.73, 0.85, 1.0]
+    47: [0.67843, 0.87059, 1.0],    # apple: [0.68, 0.87, 1.0]
+    48: [0.76863, 0.89412, 1.0],    # sandwich: [0.77, 0.89, 1.0]
+    49: [0.80392, 0.92157, 1.0],    # orange: [0.8, 0.92, 1.0]
+    50: [0.86275, 0.97255, 1.0],    # broccoli: [0.86, 0.97, 1.0]
+    51: [0.93333, 0.96078, 1.0],    # carrot: [0.93, 0.96, 1.0]
+    52: [0.96078, 0.94118, 1.0],    # hot dog: [0.96, 0.94, 1.0]
+    53: [0.98039, 0.98039, 1.0],    # pizza: [0.98, 0.98, 1.0]
+    54: [0.94118, 1.0, 0.94118],    # donut: [0.94, 1.0, 0.94]
+    55: [0.98039, 1.0, 0.96078],    # cake: [0.98, 1.0, 0.96]
+    56: [1.0, 1.0, 0.94118],        # chair: [1.0, 1.0, 0.94]
+    57: [1.0, 0.94118, 0.94118],    # couch: [1.0, 0.94, 0.94]
+    58: [1.0, 0.97255, 0.97255],    # potted plant: [1.0, 0.97, 0.97]
+    59: [0.86275, 0.94118, 0.96078],# bed: [0.86, 0.94, 0.96]
+    60: [0.90196, 0.96078, 0.99216],# dining table: [0.9, 0.96, 0.99]
+    61: [0.94118, 1.0, 1.0],        # toilet: [0.94, 1.0, 1.0]
+    62: [0.94118, 1.0, 1.0],        # tv: [0.94, 1.0, 1.0]
+    63: [0.84314, 0.92157, 0.98039],# laptop: [0.84, 0.92, 0.98]
+    64: [0.84314, 0.92157, 0.98039],# mouse: [0.84, 0.92, 0.98]
+    65: [0.83529, 0.93725, 1.0],    # remote: [0.84, 0.94, 1.0]
+    66: [0.72549, 0.8549, 1.0],     # keyboard: [0.73, 0.85, 1.0]
+    67: [0.72549, 0.8549, 1.0],     # cell phone: [0.73, 0.85, 1.0]
+    68: [0.67843, 0.87059, 1.0],    # microwave: [0.68, 0.87, 1.0]
+    69: [0.76863, 0.89412, 1.0],    # oven: [0.77, 0.89, 1.0]
+    70: [0.80392, 0.92157, 1.0],    # toaster: [0.8, 0.92, 1.0]
+    71: [0.86275, 0.97255, 1.0],    # sink: [0.86, 0.97, 1.0]
+    72: [0.93333, 0.96078, 1.0],    # refrigerator: [0.93, 0.96, 1.0]
+    73: [0.96078, 0.94118, 1.0],    # book: [0.96, 0.94, 1.0]
+    74: [0.98039, 0.98039, 1.0],    # clock: [0.98, 0.98, 1.0]
+    75: [0.94118, 1.0, 0.94118],    # vase: [0.94, 1.0, 0.94]
+    76: [0.98039, 1.0, 0.96078],    # scissors: [0.98, 1.0, 0.96]
+    77: [1.0, 1.0, 0.94118],        # teddy bear: [1.0, 1.0, 0.94]
+    78: [1.0, 0.94118, 0.94118],    # hair drier: [1.0, 0.94, 0.94]
+    79: [1.0, 0.97255, 0.97255],    # toothbrush: [1.0, 0.97, 0.97]
+    255: [0.0, 0.0, 0.0]           # background: [0.0, 0.0, 0.0]
+            }
+            
+            # 2. 将字典转换为 GPU Tensor 计算矩阵
+            palette_colors = []
+            palette_ids = []
+            for cid, color in color_dict.items():
+                palette_colors.append(color)
+                palette_ids.append(cid)
+            
+            palette_tensor = torch.tensor(palette_colors, device=device, dtype=torch.float32) # [K, 3]
+            ids_tensor = torch.tensor(palette_ids, device=device, dtype=torch.long) # [K]
+            
+            # 3. 将渲染出来的 3DGS 语义图 [3, H, W] 展平为 [H*W, 3] 像素列表
+            C, H, W = rendered_seg.shape
+            pixels = rendered_seg.view(3, -1).permute(1, 0)
+            
+            # 4. 计算所有像素到预设字典颜色的距离 (这就是降维打击)
+            # torch.cdist 会算出每个像素离字典里哪个颜色最接近
+            distances = torch.cdist(pixels, palette_tensor)
+            
+            # 5. 找出距离最近的颜色索引，并映射回真实的 ID
+            closest_idx = distances.argmin(dim=1)
+            rendered_class_id = ids_tensor[closest_idx].reshape(H, W)
+            # =========================================================================
         else:
             rendered_class_id = rendered_seg.squeeze(0)
-            print("-22222-------------------情况B--------------------")    
-        print("-进入第二层----------------------------出结果---------------------")    
+            
         rendered_dynamic = torch.isin(rendered_class_id.long(), dyn_ids)
         rendered_mask = ~rendered_dynamic.reshape(curr_data['depth'].shape)
 
     # 3. 合并掩码：根据 Tracking 还是 Mapping 采取截然不同的哲学！
     if tracking:
-        # 【Tracking 定位阶段】：惹不起躲得起！
-        # 只要现实或者记忆里有一方判定是动态，就一票否决，坚决不用它算位姿。
-        if obs_mask is not None and rendered_mask is not None:
+        # 【Tracking 定位阶段】：惹不起躲得起！双重保险防线。
+        # 第一层保险：如果现实世界告诉我们 100% 干净，直接跳过记忆纠缠，信任现实！
+        if obs_mask is not None and obs_mask.all():
+            semantic_mask = obs_mask
+        # 第二层保险：正常双向合并
+        elif obs_mask is not None and rendered_mask is not None:
             semantic_mask = obs_mask & rendered_mask
-            print("__________这个开始工作___________")
         elif obs_mask is not None:
             semantic_mask = obs_mask
         elif rendered_mask is not None:
@@ -896,7 +1254,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     else:
         # 【Mapping 建图阶段】：铁面无私，消灭幽灵！
         # 绝不包庇地图里的“渲染幽灵”。只看现实视野 (obs_mask) 是否被挡住。
-        # 如果现实是干净的墙，强行计算误差，产生巨大梯度去洗刷地图记忆里的幽灵！
         semantic_mask = obs_mask
 
     # 4. MAD 异常深度过滤 (带语义兜底保障)
@@ -908,7 +1265,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
             static_error_region = depth_error[semantic_mask & (curr_data['depth'] > 0)]
             total_valid_depth_pixels = (curr_data['depth'] > 0).sum().item()
             min_static_pixels_required = max(2000, int(total_valid_depth_pixels * 0.01))
-            print("--------min_static_pixels_required----------",min_static_pixels_required)
+            
             if static_error_region.numel() > min_static_pixels_required:
                 pure_median = static_error_region.median()
             else:
@@ -952,30 +1309,29 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
         if load_semantics and rendered_seg is not None:
             losses['seg'] = torch.abs(curr_data['semantic_color'] - rendered_seg).sum()
-    # else:
-    #     losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
-    #     if load_semantics and rendered_seg is not None:
-    #         losses['seg'] = 0.8 * l1_loss_v1(rendered_seg, curr_data['semantic_color']) \
-    #             + 0.2 * (1.0 - calc_ssim(rendered_seg, curr_data['semantic_color']))
 
-    else:     # 这是 Mapping 建图分支
-           # 1. 把 1 通道的 mask 变成 3 通道的彩色 mask
+    else:     
+          # 【Mapping 建图分支：防伪影修补法】
            color_mask = torch.tile(mask, (3, 1, 1)).detach()
+           
+           # 1. 克隆一张真实的 Ground Truth 图像
+           masked_gt_im = curr_data['im'].clone()
+           
+           # 2. 无缝替换：把真实图像中“被遮挡（比如有动态人）”的区域，
+           #    用系统脑海中渲染出来的纯净背景像素直接替换掉！
+           masked_gt_im[~color_mask] = im[~color_mask].detach()
         
-            # 2. 核心修复：给渲染图和真实图都“戴上面具”
-            # 动态人物所在的地方，乘以 0 后全部变成纯黑；静态墙壁不受影响
-           masked_im = im * color_mask
-           masked_gt_im = curr_data['im'] * color_mask
+           # 3. 直接对完整的图像算 L1 和 SSIM。
+           # 因为被遮挡区域的像素在两张图里现在是一模一样的，误差自然为 0。
+           # 更重要的是，没有了突兀的黑洞，SSIM 窗口在边缘过渡时会非常平滑，彻底消除伪影！
+           losses['im'] = 0.8 * l1_loss_v1(im, masked_gt_im) + 0.2 * (1.0 - calc_ssim(im, masked_gt_im))
         
-           # 3. 在戴了面具的图片上计算 L1 和 SSIM 误差
-           losses['im'] = 0.8 * l1_loss_v1(masked_im, masked_gt_im) + 0.2 * (1.0 - calc_ssim(masked_im, masked_gt_im))
-        
-           # 4. 如果有语义图，也同样戴上面具处理
+           # 4. 如果启用了语义渲染，对语义图也做同样的“无缝替换”处理
            if load_semantics and rendered_seg is not None:
-              masked_seg = rendered_seg * color_mask
-              masked_gt_seg = curr_data['semantic_color'] * color_mask
-              losses['seg'] = 0.8 * l1_loss_v1(masked_seg, masked_gt_seg) \
-                  + 0.2 * (1.0 - calc_ssim(masked_seg, masked_gt_seg))       
+              masked_gt_seg = curr_data['semantic_color'].clone()
+              masked_gt_seg[~color_mask] = rendered_seg[~color_mask].detach()
+              losses['seg'] = 0.8 * l1_loss_v1(rendered_seg, masked_gt_seg) \
+                  + 0.2 * (1.0 - calc_ssim(rendered_seg, masked_gt_seg)) 
 
     # Visualize the Diff Images 
     if tracking and visualize_tracking_loss:
@@ -1028,6 +1384,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     weighted_losses['loss'] = loss
 
     return loss, variables, weighted_losses
+
 
 # def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss, sil_thres,
 #              use_l1, ignore_outlier_depth_loss, tracking=False, mapping=False, do_ba=False, device="cuda",
@@ -1402,7 +1759,7 @@ def extract_orb_features(image_gray):
     keypoints, descriptors = orb.detectAndCompute(image_gray, None)
     return keypoints, descriptors
 
-def loop_detection(keyframe_list, vocab, current_gray_image, keyframe_bow_list,threshold=0.15,min_loop_interval=250):
+def loop_detection(keyframe_list, vocab, current_gray_image, keyframe_bow_list,threshold=0.15,min_loop_interval=150):
     """
     使用 DBoW2 进行回环检测，返回候选匹配 keyframe 对
 
@@ -1652,123 +2009,71 @@ def pgo_optimization(
     loop_closures: list[tuple[int, int, np.ndarray]]
 ) -> list[np.ndarray]:
     """
-    对一组关键帧位姿（w2c）和回环列表执行 Pose Graph Optimization（PGO），
-    返回优化后的关键帧位姿（w2c）。
-
-    参数:
-        keyframe_w2c_list: List[np.ndarray]
-            每个关键帧的 4×4 相机 w2c 位姿矩阵。
-        loop_closures: List[Tuple[int, int, np.ndarray]]
-            回环列表。每一个元素是 (source_idx, target_idx, transform)，
-            其中 transform 是一个 4×4 矩阵，代表从 source_keyframe 的 c2w 到
-            target_keyframe 的 c2w，即 (c2w_src)^(-1) @ c2w_tgt。
-
-    返回:
-        List[np.ndarray]:
-            优化后的每个关键帧的 4×4 相机 w2c 位姿矩阵。
+    对一组关键帧位姿（w2c）和回环列表执行 Pose Graph Optimization（PGO）
     """
-
     # 1. 创建 PoseGraph 对象
     pose_graph = o3d.pipelines.registration.PoseGraph()
 
-    # 2. 把输入的 w2c 列表全部转换成 c2w，并作为节点添加到 PoseGraph
-    #    Open3D 中，PoseGraphNode 存储的是 c2w（camera-to-world）。
-    c2w_list = [np.linalg.inv(w2c) for w2c in keyframe_w2c_list]
+    # 2. 转换 w2c 为 c2w (⚠️ 强制转换为 float64，防止 Open3D 内部精度溢出或报错)
+    c2w_list = [np.linalg.inv(w2c).astype(np.float64) for w2c in keyframe_w2c_list]
     for c2w in c2w_list:
-        node = o3d.pipelines.registration.PoseGraphNode(c2w)
-        pose_graph.nodes.append(node)
+        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(c2w))
 
-    # 3. 添加相邻帧之间的边（强约束）
-    #    每个边的 transform 要满足：(c2w_i)^(-1) @ c2w_j
-    #    也等价于 w2c_i @ (w2c_j)^(-1)
     num_keyframes = len(c2w_list)
-    # for i in range(1, num_keyframes):
-    #     # c2w_{i-1}, c2w_i
-    #     c2w_prev = c2w_list[i - 1]
-    #     c2w_curr = c2w_list[i]
-    #     # 计算 (c2w_prev)^(-1) @ c2w_curr
-    #     rel_transform = np.linalg.inv(c2w_prev) @ c2w_curr
 
-    #     information_matrix = np.identity(6) * 10  # 连续帧约束权重大约 10
-    #     edge = o3d.pipelines.registration.PoseGraphEdge(
-    #         source_node_id=i - 1,
-    #         target_node_id=i,
-    #         transformation=rel_transform,
-    #         uncertain=False,           # 相邻帧约束视为可靠
-    #         information=information_matrix
-    #     )
-    #     pose_graph.edges.append(edge)
-
-    # # 4. 添加回环边（弱约束）
-    # #    假设 loop_closures 中给出的 transform 已经是 (c2w_src)^(-1) @ c2w_tgt
-    # for (src_idx, tgt_idx, rel_loop) in loop_closures:
-    #     # 如果你确认 rel_loop = (c2w_src)^(-1) @ c2w_tgt，就可直接使用
-    #     information_loop = np.identity(6)*5  # 回环权重可设为 1 或更小
-    #     edge = o3d.pipelines.registration.PoseGraphEdge(
-    #         source_node_id=src_idx,
-    #         target_node_id=tgt_idx,
-    #         transformation=rel_loop,
-    #         uncertain=True,            # 回环约束不一定都精确
-    #         information=information_loop
-    #     )
-    #     pose_graph.edges.append(edge)
-    sigma_t = 0.02
-    sigma_r = np.deg2rad(2.0) 
-    information_matrix = np.diag(
-    [1.0/sigma_t**2]*3 + 
-    [1.0/sigma_r**2]*3
-)   
+    # 3. 设定信息矩阵 (权重的绝对值稍微缩小，保持相对比例，增加 LM 算法的数值稳定性)
+    # sigma_t = 0.01 对应的权重是 10000，数值过大有时会导致矩阵奇异。
+    # 这里我们把基准稍微放大，让数值稳定在 100 左右，但回环和里程计的相对信任度依然保持不变。
+    sigma_t = 0.1  
+    sigma_r = np.deg2rad(5.0) 
     
-    information_loop = information_matrix * 0.5
+    information_matrix = np.diag(
+        [1.0 / sigma_t**2] * 3 + 
+        [1.0 / sigma_r**2] * 3
+    ).astype(np.float64)
+    
+    information_loop = (information_matrix * 0.8).astype(np.float64)
+
+    # 4. 添加相邻帧里程计边（强约束）
     for i in range(1, num_keyframes):
        c2w_prev = c2w_list[i - 1]
        c2w_curr = c2w_list[i]
-       rel_transform = np.linalg.inv(c2w_prev) @ c2w_curr
+       rel_transform = (np.linalg.inv(c2w_prev) @ c2w_curr).astype(np.float64)
 
        edge = o3d.pipelines.registration.PoseGraphEdge(
-        source_node_id = i - 1,
-        target_node_id = i,
-        transformation  = rel_transform,
-        uncertain       = False,
-        information     = information_matrix   # 连续帧约束
-    )
-       
+           source_node_id = i - 1,
+           target_node_id = i,
+           transformation  = rel_transform,
+           uncertain       = False,               # 相邻帧绝对可靠，不参与剪除
+           information     = information_matrix   # 连续帧约束
+       )
        pose_graph.edges.append(edge)
     
+    # 5. 添加回环边（弱约束）
     for (src_idx, tgt_idx, rel_loop) in loop_closures:
         edge = o3d.pipelines.registration.PoseGraphEdge(
-         source_node_id = src_idx,
-         target_node_id = tgt_idx,
-         transformation  = rel_loop,
-         uncertain       = True,
-         information     = information_loop     # 回环弱约束
-    )
+            source_node_id = src_idx,
+            target_node_id = tgt_idx,
+            transformation  = rel_loop.astype(np.float64),
+            uncertain       = True,                # 标记为 True，允许优化器剪除假回环
+            information     = information_loop     # 回环弱约束
+        )
         pose_graph.edges.append(edge)   
-    # 5. 配置全局优化选项
+
+    # 6. 配置全局优化选项
     option = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=0.05,  # 点云尺度允许的最大对应距离
-        edge_prune_threshold=0.10,         # 若优化后一条边的残差超过 0.6m，则剪除
-        reference_node=0                  # 固定第一个节点为全局坐标的参考
+        max_correspondence_distance=0.05,  
+        edge_prune_threshold=0.25,         
+        preference_loop_closure=1.0,       # ⚠️ 新增：显式设定回环偏好权重，防止内部默认值过高
+        reference_node=0                  
     )
     
-    # 6. 选择优化算法和收敛标准
-    method = o3d.pipelines.registration.GlobalOptimizationGaussNewton()
+    # 7. 选择优化算法和收敛标准
+    method = o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt()
     criteria = o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria()
-    criteria.max_iteration    = 80    # 最多迭代 120 次
-    # criteria.relative_fitness = 1e-6   # 当拟合度的改进低于 1e-6 时就认为收敛
-    # criteria.relative_rmse    = 1e-6   # 当 RMSE（残差）改进低于 1e-6 时也认为收敛
-    # option = o3d.pipelines.registration.GlobalOptimizationOption(
-    #     max_correspondence_distance=0.3,
-    #     edge_prune_threshold=0.5,
-    #     reference_node=0
-    # )
-    # criteria = o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(
-    #     max_iteration=120,        # 最多迭代 50 次
-    #     relative_fitness=1e-6,   # 收敛阈值之一：相对“拟合度”变化
-    #     relative_rmse=1e-6       # 收敛阈值之二：相对“RMSE”变化
-    # )
+    criteria.max_iteration = 50 
 
-    # 7. 执行全局优化
+    # 8. 执行全局优化
     o3d.pipelines.registration.global_optimization(
         pose_graph,
         method=method,
@@ -1776,7 +2081,7 @@ def pgo_optimization(
         option=option
     )
 
-    # 8. 从优化后的 pose_graph 中取回 c2w，并转回 w2c
+    # 9. 提取结果并转回 w2c
     optimized_w2c_list: list[np.ndarray] = []
     for node in pose_graph.nodes:
         optimized_c2w = node.pose
@@ -1784,6 +2089,146 @@ def pgo_optimization(
         optimized_w2c_list.append(optimized_w2c)
 
     return optimized_w2c_list
+
+
+#原5.27使用
+# def pgo_optimization(
+#     keyframe_w2c_list: list[np.ndarray],
+#     loop_closures: list[tuple[int, int, np.ndarray]]
+# ) -> list[np.ndarray]:
+#     """
+#     对一组关键帧位姿（w2c）和回环列表执行 Pose Graph Optimization（PGO），
+#     返回优化后的关键帧位姿（w2c）。
+
+#     参数:
+#         keyframe_w2c_list: List[np.ndarray]
+#             每个关键帧的 4×4 相机 w2c 位姿矩阵。
+#         loop_closures: List[Tuple[int, int, np.ndarray]]
+#             回环列表。每一个元素是 (source_idx, target_idx, transform)，
+#             其中 transform 是一个 4×4 矩阵，代表从 source_keyframe 的 c2w 到
+#             target_keyframe 的 c2w，即 (c2w_src)^(-1) @ c2w_tgt。
+
+#     返回:
+#         List[np.ndarray]:
+#             优化后的每个关键帧的 4×4 相机 w2c 位姿矩阵。
+#     """
+
+#     # 1. 创建 PoseGraph 对象
+#     pose_graph = o3d.pipelines.registration.PoseGraph()
+
+#     # 2. 把输入的 w2c 列表全部转换成 c2w，并作为节点添加到 PoseGraph
+#     #    Open3D 中，PoseGraphNode 存储的是 c2w（camera-to-world）。
+#     c2w_list = [np.linalg.inv(w2c) for w2c in keyframe_w2c_list]
+#     for c2w in c2w_list:
+#         node = o3d.pipelines.registration.PoseGraphNode(c2w)
+#         pose_graph.nodes.append(node)
+
+#     # 3. 添加相邻帧之间的边（强约束）
+#     #    每个边的 transform 要满足：(c2w_i)^(-1) @ c2w_j
+#     #    也等价于 w2c_i @ (w2c_j)^(-1)
+#     num_keyframes = len(c2w_list)
+#     # for i in range(1, num_keyframes):
+#     #     # c2w_{i-1}, c2w_i
+#     #     c2w_prev = c2w_list[i - 1]
+#     #     c2w_curr = c2w_list[i]
+#     #     # 计算 (c2w_prev)^(-1) @ c2w_curr
+#     #     rel_transform = np.linalg.inv(c2w_prev) @ c2w_curr
+
+#     #     information_matrix = np.identity(6) * 10  # 连续帧约束权重大约 10
+#     #     edge = o3d.pipelines.registration.PoseGraphEdge(
+#     #         source_node_id=i - 1,
+#     #         target_node_id=i,
+#     #         transformation=rel_transform,
+#     #         uncertain=False,           # 相邻帧约束视为可靠
+#     #         information=information_matrix
+#     #     )
+#     #     pose_graph.edges.append(edge)
+
+#     # # 4. 添加回环边（弱约束）
+#     # #    假设 loop_closures 中给出的 transform 已经是 (c2w_src)^(-1) @ c2w_tgt
+#     # for (src_idx, tgt_idx, rel_loop) in loop_closures:
+#     #     # 如果你确认 rel_loop = (c2w_src)^(-1) @ c2w_tgt，就可直接使用
+#     #     information_loop = np.identity(6)*5  # 回环权重可设为 1 或更小
+#     #     edge = o3d.pipelines.registration.PoseGraphEdge(
+#     #         source_node_id=src_idx,
+#     #         target_node_id=tgt_idx,
+#     #         transformation=rel_loop,
+#     #         uncertain=True,            # 回环约束不一定都精确
+#     #         information=information_loop
+#     #     )
+#     #     pose_graph.edges.append(edge)
+#     sigma_t = 0.01
+#     sigma_r = np.deg2rad(1.0) 
+#     information_matrix = np.diag(
+#     [1.0/sigma_t**2]*3 + 
+#     [1.0/sigma_r**2]*3
+# )   
+    
+#     information_loop = information_matrix * 0.8
+#     for i in range(1, num_keyframes):
+#        c2w_prev = c2w_list[i - 1]
+#        c2w_curr = c2w_list[i]
+#        rel_transform = np.linalg.inv(c2w_prev) @ c2w_curr
+
+#        edge = o3d.pipelines.registration.PoseGraphEdge(
+#         source_node_id = i - 1,
+#         target_node_id = i,
+#         transformation  = rel_transform,
+#         uncertain       = False,
+#         information     = information_matrix   # 连续帧约束
+#     )
+       
+#        pose_graph.edges.append(edge)
+    
+#     for (src_idx, tgt_idx, rel_loop) in loop_closures:
+#         edge = o3d.pipelines.registration.PoseGraphEdge(
+#          source_node_id = src_idx,
+#          target_node_id = tgt_idx,
+#          transformation  = rel_loop,
+#          uncertain       = True,
+#          information     = information_loop     # 回环弱约束
+#     )
+#         pose_graph.edges.append(edge)   
+#     # 5. 配置全局优化选项
+#     option = o3d.pipelines.registration.GlobalOptimizationOption(
+#         max_correspondence_distance=0.05,  # 点云尺度允许的最大对应距离
+#         edge_prune_threshold=0.25,         # 若优化后一条边的残差超过 0.6m，则剪除
+#         reference_node=0                  # 固定第一个节点为全局坐标的参考
+#     )
+    
+#     # 6. 选择优化算法和收敛标准
+#     method = o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt()
+#     criteria = o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria()
+#     criteria.max_iteration    = 50    # 最多迭代 120 次
+#     # criteria.relative_fitness = 1e-6   # 当拟合度的改进低于 1e-6 时就认为收敛
+#     # criteria.relative_rmse    = 1e-6   # 当 RMSE（残差）改进低于 1e-6 时也认为收敛
+#     # option = o3d.pipelines.registration.GlobalOptimizationOption(
+#     #     max_correspondence_distance=0.3,
+#     #     edge_prune_threshold=0.5,
+#     #     reference_node=0
+#     # )
+#     # criteria = o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(
+#     #     max_iteration=120,        # 最多迭代 50 次
+#     #     relative_fitness=1e-6,   # 收敛阈值之一：相对“拟合度”变化
+#     #     relative_rmse=1e-6       # 收敛阈值之二：相对“RMSE”变化
+#     # )
+
+#     # 7. 执行全局优化
+#     o3d.pipelines.registration.global_optimization(
+#         pose_graph,
+#         method=method,
+#         criteria=criteria,
+#         option=option
+#     )
+
+#     # 8. 从优化后的 pose_graph 中取回 c2w，并转回 w2c
+#     optimized_w2c_list: list[np.ndarray] = []
+#     for node in pose_graph.nodes:
+#         optimized_c2w = node.pose
+#         optimized_w2c = np.linalg.inv(optimized_c2w)
+#         optimized_w2c_list.append(optimized_w2c)
+
+#     return optimized_w2c_list
 
 # def pgo_optimization(keyframe_poses, loop_closures,
 #                      max_trans=0.1,      # 单条回环最大平移 (m)
@@ -2123,7 +2568,7 @@ def rgbd_slam(config: dict):
     mapping_frame_time_sum = 0
     mapping_frame_time_count = 0
     refined_loop_closures = []
-    dynamic_class_ids=[0]
+    dynamic_class_ids=[]
     # Load Checkpoint
     if config['load_checkpoint']:
         checkpoint_time_idx = config['checkpoint_time_idx']
@@ -2206,13 +2651,13 @@ def rgbd_slam(config: dict):
             curr_data['semantic_color'] = semantic_color
             # semantic_id: [H, W], 每个像素的类别 ID
             # dynamic_class_ids: [list], 比如 [0, 1, 2] 表示动态物体类别
-            dyn_ids = torch.tensor(dynamic_class_ids, device=device)
-            dynamic_mask = torch.isin(semantic_id.long(), dyn_ids)  # True 表示动态物体
-            keep_mask = ~dynamic_mask  # True 表示静态像素
-            keep_mask = keep_mask.reshape(-1)
-            curr_data['mask']=keep_mask
-            if dynamic_class_ids: 
-               curr_data['dynamic_class_ids'] = dynamic_class_ids
+            # dyn_ids = torch.tensor(dynamic_class_ids, device=device)
+            # dynamic_mask = torch.isin(semantic_id.long(), dyn_ids)  # True 表示动态物体
+            # keep_mask = ~dynamic_mask  # True 表示静态像素
+            # keep_mask = keep_mask.reshape(-1)
+            # curr_data['mask']=keep_mask
+            # if dynamic_class_ids: 
+            #    curr_data['dynamic_class_ids'] = dynamic_class_ids
         
         # Initialize Data for Tracking
         if seperate_tracking_res:
@@ -2453,11 +2898,11 @@ def rgbd_slam(config: dict):
                 else:
                     densify_curr_data = curr_data
                     print("7777777777777777777777777777densify2777777777777777777777777777777") 
-                dyn_ids = torch.tensor(dynamic_class_ids, device=device)
-                # 找到动态物体的像素
-                dynamic_mask = torch.isin(densify_curr_data['semantic_id'].long(), dyn_ids)
-                # 静态像素设为 True，动态设为 False
-                densify_curr_data['mask'] = ~dynamic_mask
+                # dyn_ids = torch.tensor(dynamic_class_ids, device=device)
+                # # 找到动态物体的像素
+                # dynamic_mask = torch.isin(densify_curr_data['semantic_id'].long(), dyn_ids)
+                # # 静态像素设为 True，动态设为 False
+                # densify_curr_data['mask'] = ~dynamic_mask
                 # Add new Gaussians to the scene based on the Silhouette
                 print("==================================================================================load_semantics=",load_semantics,"================================================================")   
                 params1, variables = add_new_gaussians(params1, params_opt_exclude, variables, densify_curr_data, 
@@ -2526,11 +2971,11 @@ def rgbd_slam(config: dict):
                     else:
                         iter_data['semantic_id'] = keyframe_list[selected_rand_keyframe_idx]['semantic_id']
                         iter_data['semantic_color'] = keyframe_list[selected_rand_keyframe_idx]['semantic_color']
-                    dyn_ids = torch.tensor(dynamic_class_ids, device=device)
-                    dynamic_mask = torch.isin(iter_data['semantic_id'].long(), dyn_ids)  # True 表示动态物体
-                    keep_mask = ~dynamic_mask  # True 表示静态像素
-                    keep_mask = keep_mask.reshape(-1)
-                    iter_data['mask']=keep_mask    
+                    # dyn_ids = torch.tensor(dynamic_class_ids, device=device)
+                    # dynamic_mask = torch.isin(iter_data['semantic_id'].long(), dyn_ids)  # True 表示动态物体
+                    # keep_mask = ~dynamic_mask  # True 表示静态像素
+                    # keep_mask = keep_mask.reshape(-1)
+                    # iter_data['mask']=keep_mask    
                 # Loss for current frame
                 loss, variables, losses = get_loss(params1, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -2557,7 +3002,7 @@ def rgbd_slam(config: dict):
                                            "Mapping/step": wandb_mapping_step})
                      # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
-                        params1, variables = prune_gaussians1(params1, params_opt_exclude, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        params1, variables = prune_gaussians(params1, params_opt_exclude, variables, optimizer, iter, config['mapping']['pruning_dict'])
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Pruning": params1['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})        
@@ -2648,7 +3093,7 @@ def rgbd_slam(config: dict):
                 vocab.transform(des_list, kf_bow)
                 kf_bows_list.append(kf_bow)
                 print("!!!!111111111111111111111111",len(kf_bows_list))
-                if len(keyframe_list) > 11250:  # Ensure enough keyframes for loop detectio
+                if len(keyframe_list) > 150:  # Ensure enough keyframes for loop detectio
                     # Convert current color image to grayscale for DBoW2
                     
                  
@@ -2723,7 +3168,7 @@ def rgbd_slam(config: dict):
                             torch.cuda.empty_cache() 
                             print("55555555555555555555555555555555")
                             
-                            if info['fitness'] > 0.45 and info['rmse']<0.09:  # 或其他合理阈值
+                            if info['fitness'] > 0.43 and info['rmse']<0.04:  # 或其他合理阈值
     
                                 refined_loop_closures.append((source_idx, target_idx, refined_transform))
                             
@@ -3026,13 +3471,13 @@ def rgbd_slam(config: dict):
              with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
-                        params, variables1 = prune_gaussians1(params, params_opt_exclude1, variables1, optimizer, 20, config['mapping']['pruning_dict']) 
+                        params, variables1 = prune_gaussians(params, params_opt_exclude1, variables1, optimizer, 20, config['mapping']['pruning_dict']) 
         if num_frames==time_idx+1 and flag2==False:
              optimizer = initialize_optimizer(params1, params_opt_exclude, config['mapping']['lrs'], tracking=False)
              with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
-                        params1, variables = prune_gaussians1(params1, params_opt_exclude, variables, optimizer, 20, config['mapping']['pruning_dict']) 
+                        params1, variables = prune_gaussians(params1, params_opt_exclude, variables, optimizer, 20, config['mapping']['pruning_dict']) 
     if config['save_timestamp_keyframes']:
         # Save keyframes selected at each timestamp
         max_length = max(len(inner) for inner in timestamp_keyframes)
